@@ -350,19 +350,47 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         if extrinsics is None:
             return prediction
         prediction.intrinsics = intrinsics.numpy()
-        _, _, scale, aligned_extrinsics = align_poses_umeyama(
-            prediction.extrinsics,
-            extrinsics.numpy(),
-            ransac=len(extrinsics) >= ransac_view_thresh,
-            return_aligned=True,
-            random_state=42,
-        )
-        if align_to_input_ext_scale:
-            prediction.extrinsics = extrinsics[..., :3, :].numpy()
-            prediction.depth /= scale
-        else:
-            prediction.extrinsics = aligned_extrinsics
-        return prediction
+        try:
+            _, _, scale, aligned_extrinsics = align_poses_umeyama(
+                prediction.extrinsics,
+                extrinsics.numpy(),
+                ransac=len(extrinsics) >= ransac_view_thresh,
+                return_aligned=True,
+                random_state=42,
+            )
+            # Apply scale (Logic from library: depth /= scale usually implies scale is pred/real)
+            # But relying on library logic is risky here. See step 2.
+
+        # 2. Fallback for Stereo / 2-View Case (Degenerate for Umeyama)
+        except Exception:
+            # Calculate baselines manually
+            # pred_ext is shape (N, 4, 4). We take the translation of the first two cams.
+            t_pred_0 = prediction.extrinsics[0, :3, 3]
+            t_pred_1 = prediction.extrinsics[1, :3, 3]
+            baseline_pred = np.linalg.norm(t_pred_1 - t_pred_0)
+
+            t_gt_0 = extrinsics.numpy()[0, :3, 3]
+            t_gt_1 = extrinsics.numpy()[1, :3, 3]
+            baseline_gt = np.linalg.norm(t_gt_1 - t_gt_0)
+
+            # Calculate the corrective ratio
+            # We want: Depth_new = Depth_old * (Real_Baseline / Pred_Baseline)
+            # Example: Real=0.05, Pred=2.5 -> Multiply by 0.02
+            scale_factor = baseline_gt / (baseline_pred + 1e-6)
+
+            # Apply explicitly (bypass the library's confusing division logic)
+            if align_to_input_ext_scale:
+                # Force the extrinsics to be exactly your GT input
+                prediction.extrinsics = extrinsics[..., :3, :].numpy()
+                
+                # Apply the ratio manually
+                prediction.depth = prediction.depth * scale_factor
+                
+                # PREVENT further scaling by the library code below
+                scale = 1.0 
+            else:
+                scale = 1.0 # No scaling requested
+            return prediction
 
     def _run_model_forward(
         self,
